@@ -2,9 +2,10 @@
 import streamlit as st
 import boto3
 import numpy as np
+import pandas as pd
 from PIL import Image
 from datetime import datetime
-import io
+from io import BytesIO
 
 st.set_page_config(
     page_title="Satellite Image Analysis",
@@ -16,79 +17,117 @@ BUCKET_NAME = "satellite-image-analysis-cc1"
 REGION = "ap-south-1"
 
 st.title("🛰️ Satellite Image Analysis")
-st.subheader("Cloud-Based Geospatial Image Processing Platform")
-
-st.info(
-    "Upload a satellite image to inspect its dimensions, "
-    "color channels and basic pixel statistics. "
-    "Images are stored in your private AWS S3 bucket."
+st.write(
+    "Upload a satellite image. The application automatically "
+    "analyzes its basic pixel properties and stores the image "
+    "and results in AWS S3."
 )
+
+def get_s3_client():
+    return boto3.client(
+        "s3",
+        region_name=REGION,
+        aws_access_key_id=st.secrets["AWS_ACCESS_KEY_ID"],
+        aws_secret_access_key=st.secrets["AWS_SECRET_ACCESS_KEY"]
+    )
 
 uploaded_file = st.file_uploader(
     "Upload satellite image",
     type=["png", "jpg", "jpeg", "tif", "tiff"]
 )
 
-if uploaded_file:
+if uploaded_file is not None:
     try:
-        image = Image.open(uploaded_file)
-        image_array = np.array(image)
+        image_bytes = uploaded_file.getvalue()
 
-        st.subheader("Image Preview")
+        image = Image.open(BytesIO(image_bytes))
+        image.load()
+
+        image_array = np.asarray(image)
+
+        st.success("Image uploaded successfully. Analysis started automatically.")
+
+        left, right = st.columns(2)
+
+        with left:
+            st.subheader("Satellite Image")
+            st.image(image, use_container_width=True)
+
+        with right:
+            st.subheader("Image Information")
+            st.write("Filename:", uploaded_file.name)
+            st.write("Image dimensions:", image.size)
+            st.write("Image mode:", image.mode)
+            st.write("Array shape:", image_array.shape)
+            st.write("Data type:", str(image_array.dtype))
+
+            st.subheader("Pixel Statistics")
+            st.metric("Minimum pixel value", float(image_array.min()))
+            st.metric("Maximum pixel value", float(image_array.max()))
+            st.metric("Mean pixel value", round(float(image_array.mean()), 3))
 
         if image_array.ndim == 2:
-            st.image(image_array, caption="Grayscale image")
+            statistics = {
+                "Band": ["Grayscale"],
+                "Mean": [float(image_array.mean())],
+                "Minimum": [int(image_array.min())],
+                "Maximum": [int(image_array.max())]
+            }
         else:
-            st.image(image_array, caption="Satellite image")
+            channels = image_array.shape[2]
+            names = ["Red", "Green", "Blue", "Alpha"]
 
-        col1, col2, col3 = st.columns(3)
+            statistics = {
+                "Band": [
+                    names[i] if i < len(names) else f"Channel {i + 1}"
+                    for i in range(channels)
+                ],
+                "Mean": [
+                    float(image_array[:, :, i].mean())
+                    for i in range(channels)
+                ],
+                "Minimum": [
+                    int(image_array[:, :, i].min())
+                    for i in range(channels)
+                ],
+                "Maximum": [
+                    int(image_array[:, :, i].max())
+                    for i in range(channels)
+                ]
+            }
 
-        with col1:
-            st.metric("Width", image.width, "pixels")
+        results = pd.DataFrame(statistics)
 
-        with col2:
-            st.metric("Height", image.height, "pixels")
+        st.subheader("Channel-wise Analysis")
+        st.dataframe(results, use_container_width=True)
 
-        with col3:
-            st.metric("Channels", 1 if image_array.ndim == 2
-                      else image_array.shape[2])
+        with st.spinner("Saving image and analysis results to AWS S3..."):
+            s3 = get_s3_client()
 
-        st.subheader("Image Statistics")
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            safe_name = uploaded_file.name.replace("/", "_").replace("\\", "_")
 
-        st.write("Array shape:", image_array.shape)
-        st.write("Pixel data type:", str(image_array.dtype))
-        st.write("Minimum pixel value:", int(image_array.min()))
-        st.write("Maximum pixel value:", int(image_array.max()))
-        st.write("Mean pixel value:", round(float(image_array.mean()), 2))
+            image_key = f"input/{timestamp}_{safe_name}"
+            results_key = f"output/{timestamp}_analysis.csv"
 
-        if st.button("Upload image to AWS S3"):
-            session = boto3.Session(
-                aws_access_key_id=st.secrets["AWS_ACCESS_KEY_ID"],
-                aws_secret_access_key=st.secrets["AWS_SECRET_ACCESS_KEY"],
-                region_name=REGION
+            s3.put_object(
+                Bucket=BUCKET_NAME,
+                Key=image_key,
+                Body=image_bytes
             )
 
-            s3 = session.client("s3")
+            csv_bytes = results.to_csv(index=False).encode("utf-8")
 
-            uploaded_file.seek(0)
-
-            extension = uploaded_file.name.rsplit(".", 1)[-1].lower()
-
-            object_key = (
-                "input/satellite_image_"
-                + datetime.now().strftime("%Y%m%d_%H%M%S")
-                + "."
-                + extension
+            s3.put_object(
+                Bucket=BUCKET_NAME,
+                Key=results_key,
+                Body=csv_bytes,
+                ContentType="text/csv"
             )
 
-            s3.upload_fileobj(
-                uploaded_file,
-                BUCKET_NAME,
-                object_key
-            )
-
-            st.success("Satellite image uploaded successfully!")
-            st.write("S3 object:", object_key)
+        st.success("Analysis completed and saved to AWS S3!")
+        st.write("Image stored at:", image_key)
+        st.write("Analysis stored at:", results_key)
 
     except Exception as error:
-        st.error(f"Processing error: {error}")
+        st.error(f"Could not process this image: {error}")
