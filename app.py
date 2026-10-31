@@ -1,176 +1,203 @@
-import streamlit as st
-import pandas as pd
-import numpy as np
-from PIL import Image, UnidentifiedImageError
-from io import BytesIO
-from zipfile import ZipFile, BadZipFile
+import io
+import zipfile
+from datetime import datetime, timezone
 from pathlib import PurePosixPath
 
-st.set_page_config(
-    page_title="Satellite Image Analysis",
-    page_icon="🛰️",
-    layout="wide",
-)
+import boto3
+import pandas as pd
+import streamlit as st
+from PIL import Image, UnidentifiedImageError
 
+
+st.set_page_config(page_title="Satellite Image Analysis", page_icon="🛰️", layout="wide")
 st.title("🛰️ Satellite Image Analysis")
 st.write(
-    "Upload a ZIP containing your dataset folders, or select individual images. "
-    "The app summarizes each image and creates a downloadable CSV report."
+    "Upload a ZIP of images or individual images. The app calculates basic image "
+    "statistics, creates a CSV report, and can save the input and results to S3."
 )
 
 st.info(
-    "Educational demo: the green-pixel estimate is a simple RGB heuristic, "
-    "not scientific vegetation classification or NDVI. True NDVI requires red "
-    "and near-infrared (NIR) band data."
+    "Educational demo: green-pixel percentage is a simple RGB heuristic, "
+    "not scientific vegetation classification or NDVI. True NDVI requires "
+    "appropriate red and near-infrared band data."
 )
 
-IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tif", ".tiff"}
+ALLOWED_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tif", ".tiff"}
 
 
-def analyze_image(image_bytes):
-    """Calculate basic image statistics from an image."""
-    image = Image.open(BytesIO(image_bytes)).convert("RGB")
-    pixels = np.asarray(image, dtype=np.uint8)
-
-    red = pixels[:, :, 0].astype(np.int16)
-    green = pixels[:, :, 1].astype(np.int16)
-    blue = pixels[:, :, 2].astype(np.int16)
-
-    green_dominant = (
-        (green > red * 1.10)
-        & (green > blue * 1.05)
-        & (green > 40)
+def get_s3_client():
+    """Create an S3 client using credentials from Streamlit secrets."""
+    return boto3.client(
+        "s3",
+        aws_access_key_id=st.secrets["AWS_ACCESS_KEY_ID"],
+        aws_secret_access_key=st.secrets["AWS_SECRET_ACCESS_KEY"],
+        region_name=st.secrets["AWS_REGION"],
     )
 
+
+def upload_to_s3(data: bytes, key: str, content_type: str):
+    """Upload bytes to the configured private S3 bucket."""
+    s3 = get_s3_client()
+    s3.put_object(
+        Bucket=st.secrets["S3_BUCKET"],
+        Key=key,
+        Body=data,
+        ContentType=content_type,
+    )
+
+
+def analyze_image(image_bytes: bytes, filename: str) -> dict:
+    """Calculate basic RGB statistics for one image."""
+    with Image.open(io.BytesIO(image_bytes)) as image:
+        rgb = image.convert("RGB")
+        width, height = rgb.size
+        pixels = list(rgb.getdata())
+
+    total_pixels = len(pixels)
+    red_avg = sum(pixel[0] for pixel in pixels) / total_pixels
+    green_avg = sum(pixel[1] for pixel in pixels) / total_pixels
+    blue_avg = sum(pixel[2] for pixel in pixels) / total_pixels
+
+    # Simple RGB heuristic only; this is not NDVI.
+    green_dominant = sum(
+        1 for red, green, blue in pixels
+        if green > red and green > blue
+    )
+    green_percentage = 100 * green_dominant / total_pixels
+
     return {
-        "image": image,
-        "width": image.width,
-        "height": image.height,
-        "pixel_count": image.width * image.height,
-        "mean_red": round(float(red.mean()), 2),
-        "mean_green": round(float(green.mean()), 2),
-        "mean_blue": round(float(blue.mean()), 2),
-        "green_dominant_percent": round(float(green_dominant.mean() * 100), 2),
+        "filename": filename,
+        "width": width,
+        "height": height,
+        "pixel_count": total_pixels,
+        "average_red": round(red_avg, 2),
+        "average_green": round(green_avg, 2),
+        "average_blue": round(blue_avg, 2),
+        "green_dominant_pixel_percent": round(green_percentage, 2),
     }
 
 
-def images_from_zip(zip_file):
-    """Read supported images from a ZIP without extracting them to disk."""
-    image_items = []
+def safe_zip_images(zip_bytes: bytes):
+    """Extract supported image files from a ZIP without writing them to disk."""
+    images = []
 
-    try:
-        with ZipFile(zip_file) as archive:
-            for entry in archive.infolist():
-                if entry.is_dir():
-                    continue
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as archive:
+        for member in archive.infolist():
+            if member.is_dir():
+                continue
 
-                path = PurePosixPath(entry.filename)
+            # Ignore folders and unsupported files.
+            member_path = PurePosixPath(member.filename)
+            if member_path.suffix.lower() not in ALLOWED_EXTENSIONS:
+                continue
 
-                # Ignore hidden files and common macOS ZIP metadata.
-                if any(part.startswith(".") for part in path.parts):
-                    continue
-                if "__MACOSX" in path.parts:
-                    continue
-                if path.suffix.lower() not in IMAGE_EXTENSIONS:
-                    continue
+            # Read the image bytes directly from the ZIP.
+            images.append((member.filename, archive.read(member)))
 
-                # The first folder inside the ZIP is used as the class/category.
-                category = path.parent.name if path.parent.name else "Uncategorized"
-
-                image_items.append({
-                    "filename": path.name,
-                    "relative_path": entry.filename,
-                    "category": category,
-                    "bytes": archive.read(entry),
-                })
-
-    except BadZipFile:
-        st.error("That file is not a valid ZIP archive.")
-        return []
-
-    return image_items
+    return images
 
 
-zip_upload = st.file_uploader(
-    "Upload your dataset as a ZIP file",
-    type=["zip"],
-    help="ZIP your dataset folder so its class folders (Forest, AnnualCrop, etc.) are inside it.",
-)
-
-individual_uploads = st.file_uploader(
+st.subheader("Upload images")
+zip_file = st.file_uploader("Upload a ZIP containing images", type=["zip"])
+image_files = st.file_uploader(
     "Or select individual images",
     type=["png", "jpg", "jpeg", "tif", "tiff"],
     accept_multiple_files=True,
-    key="individual_images",
 )
 
-image_items = []
+uploaded_images = []
 
-if zip_upload is not None:
-    image_items.extend(images_from_zip(zip_upload))
+if zip_file is not None:
+    try:
+        uploaded_images.extend(safe_zip_images(zip_file.getvalue()))
+    except zipfile.BadZipFile:
+        st.error("The uploaded file is not a valid ZIP archive.")
 
-if individual_uploads:
-    for uploaded_file in individual_uploads:
-        image_items.append({
-            "filename": uploaded_file.name,
-            "relative_path": uploaded_file.name,
-            "category": "Individual upload",
-            "bytes": uploaded_file.getvalue(),
-        })
+for image_file in image_files or []:
+    uploaded_images.append((image_file.name, image_file.getvalue()))
 
-if image_items:
-    st.write(f"Found **{len(image_items)}** image(s) to analyze.")
+# Avoid duplicate filenames from ZIP and individual uploads.
+if uploaded_images:
+    st.write(f"Images found: **{len(uploaded_images)}**")
 
-    results = []
-    preview_columns = st.columns(2)
+    if st.button("Analyze images"):
+        results = []
+        input_objects = []
 
-    for index, item in enumerate(image_items):
+        progress = st.progress(0)
+        status = st.empty()
+
+        for index, (filename, image_bytes) in enumerate(uploaded_images, start=1):
+            status.write(f"Analyzing {filename} ({index}/{len(uploaded_images)})")
+
+            try:
+                results.append(analyze_image(image_bytes, filename))
+                input_objects.append((filename, image_bytes))
+            except (UnidentifiedImageError, OSError, ValueError):
+                st.warning(f"Skipped unreadable image: {filename}")
+
+            progress.progress(index / len(uploaded_images))
+
+        if results:
+            report_df = pd.DataFrame(results)
+            csv_bytes = report_df.to_csv(index=False).encode("utf-8")
+
+            st.session_state["analysis_results"] = report_df
+            st.session_state["analysis_csv"] = csv_bytes
+            st.session_state["input_objects"] = input_objects
+
+            status.success("Analysis complete.")
+        else:
+            st.error("No readable images were found.")
+
+if "analysis_results" in st.session_state:
+    report_df = st.session_state["analysis_results"]
+    csv_bytes = st.session_state["analysis_csv"]
+
+    st.subheader("Analysis results")
+    st.dataframe(report_df, use_container_width=True)
+
+    st.download_button(
+        label="Download analysis CSV",
+        data=csv_bytes,
+        file_name="satellite_analysis_results.csv",
+        mime="text/csv",
+    )
+
+    st.subheader("Save files to S3")
+    st.caption(
+        "Uploads original images under input/ and the CSV report under results/ "
+        "in your configured bucket."
+    )
+
+    if st.button("Upload images and CSV to S3"):
         try:
-            stats = analyze_image(item["bytes"])
+            timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
-            results.append({
-                "filename": item["filename"],
-                "relative_path": item["relative_path"],
-                "category": item["category"],
-                "width": stats["width"],
-                "height": stats["height"],
-                "pixel_count": stats["pixel_count"],
-                "mean_red": stats["mean_red"],
-                "mean_green": stats["mean_green"],
-                "mean_blue": stats["mean_blue"],
-                "green_dominant_percent": stats["green_dominant_percent"],
-            })
+            # Upload each successfully analyzed original image.
+            for index, (filename, image_bytes) in enumerate(
+                st.session_state["input_objects"], start=1
+            ):
+                safe_name = PurePosixPath(filename).name.replace(" ", "_")
+                image_key = f"input/{timestamp}/{index}_{safe_name}"
 
-            # Show a small preview of the first few images.
-            if index < 4:
-                with preview_columns[index % 2]:
-                    st.image(
-                        stats["image"],
-                        caption=f"{item['category']} / {item['filename']}",
-                        use_container_width=True,
-                    )
-                    st.caption(
-                        f"{stats['width']} × {stats['height']} pixels · "
-                        f"Green-dominant: {stats['green_dominant_percent']}%"
-                    )
+                upload_to_s3(
+                    image_bytes,
+                    image_key,
+                    "application/octet-stream",
+                )
 
-        except (UnidentifiedImageError, OSError, ValueError) as error:
-            st.warning(f"Could not read {item['relative_path']}: {error}")
+            # Upload the generated CSV report.
+            csv_key = f"results/satellite_analysis_{timestamp}.csv"
+            upload_to_s3(csv_bytes, csv_key, "text/csv")
 
-    if results:
-        results_df = pd.DataFrame(results)
+            st.success(
+                "Upload complete. Original images and the CSV report are saved "
+                f"in bucket: {st.secrets['S3_BUCKET']}"
+            )
+            st.write(f"CSV object key: `{csv_key}`")
 
-        st.subheader("Analysis summary")
-        st.dataframe(results_df, use_container_width=True)
-
-        csv_data = results_df.to_csv(index=False).encode("utf-8")
-
-        st.download_button(
-            label="Download analysis as CSV",
-            data=csv_data,
-            file_name="satellite_image_analysis.csv",
-            mime="text/csv",
-        )
-
+        except Exception as error:
+            st.error(f"S3 upload failed: {error}")
 else:
-    st.warning("Upload a ZIP dataset or select individual images to begin.")
+    st.warning("Upload a ZIP or individual images, then click **Analyze images**.")
